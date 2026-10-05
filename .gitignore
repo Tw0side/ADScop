@@ -1,0 +1,7 @@
+token.txt
+*.txt
+recon_*/
+dc_candidates.txt
+live_candidates.txt
+live_confirmed.txt
+scan_targets.txt
