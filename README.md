@@ -1,4 +1,4 @@
-# adscope
+# ADScop
 
 A lightweight bash-based reconnaissance tool for Active Directory environments. Designed for internal network engagements, `adscope` automates the initial enumeration phase: host discovery, DC identification, and pre-authentication attack surface mapping.
 
